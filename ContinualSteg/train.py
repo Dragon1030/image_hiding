@@ -41,6 +41,10 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--shared_lr_scale", type=float, default=0.1,
                         help="learning-rate multiplier for shared UDH weights after task 0")
+    parser.add_argument("--secret_weight", type=float, default=0.75,
+                        help="UDH reconstruction-loss weight")
+    parser.add_argument("--loss", choices=["mse", "l1"], default="mse",
+                        help="clean-task loss; UDH baseline uses mse")
     parser.add_argument("--adapter_bottleneck", type=int, default=32)
     parser.add_argument("--prompt_dim", type=int, default=64)
     parser.add_argument("--replay_capacity", type=int, default=256)
@@ -73,11 +77,12 @@ def make_loader(root, image_size, batch_size, workers, shuffle):
                       num_workers=workers, drop_last=shuffle, pin_memory=True)
 
 
-def _task_loss(model, cover, secret, task: Task):
+def _task_loss(model, cover, secret, task: Task, loss_name="mse", secret_weight=0.75):
     container, _ = model.hide_reveal(cover, secret, task.task_id)
     attacked = apply_attack(container, task)
     recovered = model.reveal_container(attacked, task.task_id)
-    return (F.l1_loss(container, cover), F.l1_loss(recovered, secret), container, recovered)
+    criterion = F.mse_loss if loss_name == "mse" else F.l1_loss
+    return (criterion(container, cover), secret_weight * criterion(recovered, secret), container, recovered)
 
 
 def _distill_loss(model, old_model, cover, secret, task_ids, device):
@@ -104,7 +109,8 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
             if args.max_train_batches and batch_index >= args.max_train_batches:
                 break
             cover, secret = cover.to(device, non_blocking=True), secret.to(device, non_blocking=True)
-            cover_loss, secret_loss, _, _ = _task_loss(model, cover, secret, task)
+            cover_loss, secret_loss, _, _ = _task_loss(
+                model, cover, secret, task, args.loss, args.secret_weight)
             replay_loss = torch.zeros((), device=device)
             distill_loss = torch.zeros((), device=device)
 
@@ -117,7 +123,8 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
                     mask = old_task == replay_task_id
                     replay_task = next(item for item in TASKS.values() if item.task_id == int(replay_task_id))
                     replay_cover_loss, replay_secret_loss, _, _ = _task_loss(
-                        model, old_cover[mask], old_secret[mask], replay_task)
+                        model, old_cover[mask], old_secret[mask], replay_task,
+                        args.loss, args.secret_weight)
                     replay_terms.append(replay_cover_loss + replay_secret_loss)
                 replay_loss = torch.stack(replay_terms).mean()
                 if old_model is not None:
