@@ -8,8 +8,6 @@ import torch.nn.functional as F
 
 
 class SpatialAdapter(nn.Module):
-    """AIM/RwF-style zero-initialized bottleneck adapter."""
-
     def __init__(self, channels: int, bottleneck: int):
         super().__init__()
         hidden = max(1, min(channels, bottleneck))
@@ -32,57 +30,84 @@ class PromptBank(nn.Module):
         return self.prompts[int(task_id)].view(1, -1).expand(batch_size, -1).to(device)
 
 
+class _UnetBlock(nn.Module):
+    """Recursive block matching the original UDH HidingUNet."""
+
+    def __init__(self, outer_channels: int, inner_channels: int, submodule=None,
+                 input_channels: int | None = None, outermost=False, innermost=False):
+        super().__init__()
+        self.outermost = outermost
+        self.innermost = innermost
+        input_channels = input_channels or outer_channels
+        down = nn.Conv2d(input_channels, inner_channels, 4, 2, 1)
+        if outermost:
+            up = nn.ConvTranspose2d(inner_channels * 2, outer_channels, 4, 2, 1)
+            self.model = nn.Sequential(down, submodule, nn.ReLU(True), up, nn.Tanh())
+        elif innermost:
+            up = nn.ConvTranspose2d(inner_channels, outer_channels, 4, 2, 1)
+            self.model = nn.Sequential(nn.LeakyReLU(0.2, True), down, nn.ReLU(True), up)
+        else:
+            up = nn.ConvTranspose2d(inner_channels * 2, outer_channels, 4, 2, 1)
+            self.model = nn.Sequential(nn.LeakyReLU(0.2, True), down, submodule, nn.ReLU(True), up)
+
+    def forward(self, x):
+        if self.outermost:
+            return self.model(x)
+        return torch.cat([x, self.model(x)], dim=1)
+
+
 class HidingNet(nn.Module):
-    """Compact UDH-style hiding network with a task adapter at the bottleneck."""
+    """UDH cover-independent HidingUNet with a residual output."""
 
     def __init__(self, adapter_bottleneck: int, num_tasks: int, prompt_dim: int):
         super().__init__()
-        self.enc1 = nn.Sequential(nn.Conv2d(6, 64, 3, 2, 1), nn.ReLU(inplace=True))
-        self.enc2 = nn.Sequential(nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True))
-        self.enc3 = nn.Sequential(nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(inplace=True))
-        self.adapters = nn.ModuleList([SpatialAdapter(256, adapter_bottleneck) for _ in range(num_tasks)])
-        self.prompt_bias = nn.ModuleList([nn.Linear(prompt_dim, 256) for _ in range(num_tasks)])
+        block = _UnetBlock(512, 512, innermost=True)
+        block = _UnetBlock(256, 512, block)
+        block = _UnetBlock(128, 256, block)
+        block = _UnetBlock(64, 128, block)
+        self.model = _UnetBlock(3, 64, block, input_channels=3, outermost=True)
+        self.adapters = nn.ModuleList([SpatialAdapter(3, adapter_bottleneck) for _ in range(num_tasks)])
+        self.prompt_bias = nn.ModuleList([nn.Linear(prompt_dim, 3) for _ in range(num_tasks)])
         for layer in self.prompt_bias:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 3, 4, 2, 1), nn.Sigmoid(),
-        )
 
     def forward(self, cover: Tensor, secret: Tensor, task_id: int, prompt: Tensor) -> Tensor:
-        x = self.enc3(self.enc2(self.enc1(torch.cat([cover, secret], dim=1))))
-        x = self.adapters[int(task_id)](x)
-        x = x + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
-        return self.dec(x)
+        del cover
+        residual = self.model(secret)
+        residual = self.adapters[int(task_id)](residual)
+        residual = residual + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
+        return residual * (10.0 / 255.0)
 
 
 class RevealNet(nn.Module):
+    """The original UDH six-convolution RevealNet with task adapters."""
+
     def __init__(self, adapter_bottleneck: int, num_tasks: int, prompt_dim: int):
         super().__init__()
-        self.enc1 = nn.Sequential(nn.Conv2d(3, 64, 3, 2, 1), nn.ReLU(inplace=True))
-        self.enc2 = nn.Sequential(nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True))
-        self.enc3 = nn.Sequential(nn.Conv2d(128, 256, 3, 2, 1), nn.ReLU(inplace=True))
+        self.conv1 = nn.Conv2d(3, 64, 3, 1, 1)
+        self.conv2 = nn.Conv2d(64, 128, 3, 1, 1)
+        self.conv3 = nn.Conv2d(128, 256, 3, 1, 1)
+        self.conv4 = nn.Conv2d(256, 128, 3, 1, 1)
+        self.conv5 = nn.Conv2d(128, 64, 3, 1, 1)
+        self.conv6 = nn.Conv2d(64, 3, 3, 1, 1)
         self.adapters = nn.ModuleList([SpatialAdapter(256, adapter_bottleneck) for _ in range(num_tasks)])
         self.prompt_bias = nn.ModuleList([nn.Linear(prompt_dim, 256) for _ in range(num_tasks)])
         for layer in self.prompt_bias:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 3, 4, 2, 1), nn.Sigmoid(),
-        )
+        self.relu = nn.ReLU(True)
+
+    def extract_feature(self, container: Tensor) -> Tensor:
+        return self.relu(self.conv3(self.relu(self.conv2(self.relu(self.conv1(container))))))
 
     def forward(self, container: Tensor, task_id: int, prompt: Tensor) -> Tensor:
         x = self.extract_feature(container)
         x = self.adapters[int(task_id)](x)
         x = x + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
-        return self.dec(x)
-
-    def extract_feature(self, container: Tensor) -> Tensor:
-        return self.enc3(self.enc2(self.enc1(container)))
+        x = self.relu(self.conv4(x))
+        x = self.relu(self.conv5(x))
+        return torch.sigmoid(self.conv6(x))
 
 
 class ContinualHidingModel(nn.Module):
@@ -97,35 +122,20 @@ class ContinualHidingModel(nn.Module):
 
     def hide_reveal(self, cover: Tensor, secret: Tensor, task_id: int):
         prompt = self.prompt_bank(task_id, cover.shape[0], cover.device)
-        container = self.hiding(cover, secret, task_id, prompt)
-        recovered = self.reveal(container, task_id, prompt)
-        return container, recovered
+        container = (cover + self.hiding(cover, secret, task_id, prompt)).clamp(0, 1)
+        return container, self.reveal(container, task_id, prompt)
 
     def reveal_container(self, container: Tensor, task_id: int):
-        """Reveal a container using the prompt assigned to ``task_id``."""
         prompt = self.prompt_bank(task_id, container.shape[0], container.device)
         return self.reveal(container, task_id, prompt)
 
-    def freeze_backbone(self):
+    def train_only_task(self, task_id: int, train_shared: bool = True):
         for name, parameter in self.named_parameters():
-            parameter.requires_grad = (
-                "adapters." in name
-                or "prompt_bias." in name
-                or "prompt_bank.prompts" in name
-            )
-
-    def train_only_task(self, task_id: int):
-        self.freeze_backbone()
-        for name, parameter in self.named_parameters():
-            if "adapters." in name or "prompt_bias." in name:
-                parameter.requires_grad = (
-                    f"adapters.{int(task_id)}." in name
-                    or f"prompt_bias.{int(task_id)}." in name
-                )
-            elif "prompt_bank.prompts" in name:
-                parameter.requires_grad = f"prompt_bank.prompts.{int(task_id)}" in name
-            else:
-                parameter.requires_grad = False
+            is_active = (f"adapters.{int(task_id)}." in name or
+                         f"prompt_bias.{int(task_id)}." in name or
+                         f"prompt_bank.prompts.{int(task_id)}" in name)
+            is_shared = not any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts"))
+            parameter.requires_grad = is_active or (train_shared and is_shared)
 
     def clone_frozen(self):
         old = deepcopy(self).eval()
@@ -142,8 +152,7 @@ class ContinualHidingModel(nn.Module):
 
     @torch.no_grad()
     def route(self, container: Tensor):
-        feature = self.reveal.extract_feature(container).mean(dim=(2, 3))
-        feature = F.normalize(feature, dim=-1)
+        feature = F.normalize(self.reveal.extract_feature(container).mean(dim=(2, 3)), dim=-1)
         valid = self.prototype_valid
         if not bool(valid.any()):
             raise RuntimeError("no task prototypes have been collected")
@@ -154,8 +163,6 @@ class ContinualHidingModel(nn.Module):
     @torch.no_grad()
     def recover_unknown(self, container: Tensor):
         task_ids = self.route(container)
-        outputs = []
-        for index, task_id in enumerate(task_ids.tolist()):
-            prompt = self.prompt_bank(int(task_id), 1, container.device)
-            outputs.append(self.reveal(container[index:index + 1], int(task_id), prompt))
+        outputs = [self.reveal_container(container[i:i + 1], int(task_id))
+                   for i, task_id in enumerate(task_ids.tolist())]
         return torch.cat(outputs, dim=0), task_ids

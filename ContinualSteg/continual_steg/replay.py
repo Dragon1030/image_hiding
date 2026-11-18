@@ -12,28 +12,32 @@ class ReplayItem:
 
 
 class ReplayBuffer:
+    """Reservoir replay of image pairs and the task that produced them."""
+
     def __init__(self, capacity: int = 256):
-        self.capacity = capacity
+        self.capacity = max(0, int(capacity))
         self.items: List[ReplayItem] = []
         self.seen = 0
 
     def add(self, cover: torch.Tensor, secret: torch.Tensor, task_id: int):
+        if self.capacity == 0:
+            return
         for c, s in zip(cover.detach().cpu(), secret.detach().cpu()):
             self.seen += 1
             item = ReplayItem(c.clone(), s.clone(), int(task_id))
             if len(self.items) < self.capacity:
                 self.items.append(item)
-            else:
-                slot = torch.randint(self.seen, (1,)).item()
-                if slot < self.capacity:
-                    self.items[slot] = item
+                continue
+            slot = torch.randint(self.seen, (1,)).item()
+            if slot < self.capacity:
+                self.items[slot] = item
 
     def sample(self, count: int):
-        if not self.items:
+        if not self.items or count <= 0:
             return None
-        count = min(count, len(self.items))
-        idx = torch.randperm(len(self.items))[:count].tolist()
-        items = [self.items[i] for i in idx]
+        count = min(int(count), len(self.items))
+        indices = torch.randperm(len(self.items))[:count].tolist()
+        items = [self.items[i] for i in indices]
         return (
             torch.stack([x.cover for x in items]),
             torch.stack([x.secret for x in items]),

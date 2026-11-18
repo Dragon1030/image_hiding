@@ -1,7 +1,7 @@
 # ContinualSteg
 
 ContinualSteg is a runnable research baseline for continual robust image
-information hiding. It combines a compact UDH-style hiding/reveal network,
+information hiding. It combines a UDH HidingUNet/RevealNet with continual task adapters,
 RwF-style isolated task paths, AIM-style parameter-efficient adapters, replay,
 distillation, and prompt/prototype routing.
 
@@ -23,7 +23,7 @@ The detailed RwF/UDH comparison and metric-analysis notes are in
 The default continual stream is:
 
 ```text
-clean -> JPEG-like quantization -> Gaussian noise -> resize -> crop
+clean -> JPEG -> Gaussian noise -> resize -> blur
 ```
 
 The clean stage trains the base hiding/reveal network. Later stages freeze the
@@ -54,7 +54,7 @@ so that the task-adaptation and forgetting effects can be measured separately.
 The default stream is:
 
 ```
-0 clean -> 1 JPEG-like quantization -> 2 Gaussian noise -> 3 resize -> 4 crop
+0 clean -> 1 JPEG -> 2 Gaussian noise -> 3 resize -> 4 blur
 ```
 
 Stage 0 trains the base hiding network. From stage 1 onward the base and old
@@ -140,7 +140,7 @@ python train.py \
   --image_size 256 \
   --batch_size 8 \
   --epochs_per_task 50 \
-  --tasks clean,jpeg,gaussian,resize,crop \
+  --tasks clean,jpeg,gaussian,resize,blur \
   --checkpoint_dir runs/div2k_continual
 ```
 
@@ -201,7 +201,7 @@ python train.py --mode eval \
   --val_dir /data/zhangle/HiNet/DIV2K_valid_HR \
   --checkpoint runs/div2k_continual/stage_04.pt \
   --checkpoint_dir runs/div2k_continual \
-  --tasks clean,jpeg,gaussian,resize,crop
+  --tasks clean,jpeg,gaussian,resize,blur
 ```
 
 The CSV contains cover PSNR/SSIM, recovered-secret PSNR/SSIM, APD and
@@ -233,7 +233,7 @@ python tools/visualize.py \
   --checkpoint runs/div2k_continual/stage_04.pt \
   --val_dir /data/zhangle/HiNet/DIV2K_valid_HR \
   --image_size 128 \
-  --tasks clean,jpeg,gaussian,resize,crop \
+  --tasks clean,jpeg,gaussian,resize,blur \
   --max_samples 8 \
   --out_dir runs/div2k_continual/visuals
 ```

@@ -5,7 +5,6 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
@@ -17,7 +16,7 @@ def image_files(root: str) -> List[Path]:
 
 
 class PairedImageDataset(Dataset):
-    """Samples a cover and a secret independently from one image folder."""
+    """Samples cover and secret independently, matching the UDH data protocol."""
 
     def __init__(self, root: str, image_size: int, length: int | None = None):
         self.files = image_files(root)
@@ -33,6 +32,8 @@ class PairedImageDataset(Dataset):
     def __getitem__(self, index: int):
         cover_path = self.files[index % len(self.files)]
         secret_path = self.files[(index * 997 + 17) % len(self.files)]
-        cover = self.transform(Image.open(cover_path).convert("RGB"))
-        secret = self.transform(Image.open(secret_path).convert("RGB"))
-        return cover, secret
+        with Image.open(cover_path) as cover_image, Image.open(secret_path) as secret_image:
+            return (
+                self.transform(cover_image.convert("RGB")),
+                self.transform(secret_image.convert("RGB")),
+            )
