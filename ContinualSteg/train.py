@@ -92,9 +92,13 @@ def _distill_loss(model, old_model, cover, secret, task_ids, device):
         task = next(item for item in TASKS.values() if item.task_id == int(old_task_id))
         with torch.no_grad():
             old_container, _ = old_model.hide_reveal(cover[mask], secret[mask], int(old_task_id))
-            old_recovered = old_model.reveal_container(apply_attack(old_container, task), int(old_task_id))
+            noise = (torch.randn_like(old_container) * task.severity
+                     if task.name == "gaussian" else None)
+            old_recovered = old_model.reveal_container(
+                apply_attack(old_container, task, noise), int(old_task_id))
         new_container, _ = model.hide_reveal(cover[mask], secret[mask], int(old_task_id))
-        new_recovered = model.reveal_container(apply_attack(new_container, task), int(old_task_id))
+        new_recovered = model.reveal_container(
+            apply_attack(new_container, task, noise), int(old_task_id))
         terms.extend([F.mse_loss(new_container, old_container), F.mse_loss(new_recovered, old_recovered)])
     return torch.stack(terms).mean() if terms else torch.zeros((), device=device)
 

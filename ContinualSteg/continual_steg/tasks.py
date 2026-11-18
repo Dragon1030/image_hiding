@@ -34,12 +34,13 @@ def _jpeg_one(image: torch.Tensor, quality: int) -> torch.Tensor:
     return result.to(device=image.device, dtype=image.dtype)
 
 
-def apply_attack(x: torch.Tensor, task: Task) -> torch.Tensor:
+def apply_attack(x: torch.Tensor, task: Task, gaussian_noise: torch.Tensor | None = None) -> torch.Tensor:
     """Apply a training/evaluation attack. JPEG uses real encode/decode with STE."""
     if task.name == "clean":
         return x.clamp(0, 1)
     if task.name == "gaussian":
-        return (x + torch.randn_like(x) * task.severity).clamp(0, 1)
+        noise = gaussian_noise if gaussian_noise is not None else torch.randn_like(x) * task.severity
+        return (x + noise).clamp(0, 1)
     if task.name == "jpeg":
         quality = max(1, min(100, int(task.severity)))
         encoded = torch.stack([_jpeg_one(item, quality) for item in x])
