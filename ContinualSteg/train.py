@@ -15,7 +15,7 @@ from continual_steg.data import PairedImageDataset
 from continual_steg.metrics import apd, psnr, ssim
 from continual_steg.models import ContinualHidingModel
 from continual_steg.replay import ReplayBuffer
-from continual_steg.tasks import TASKS, apply_attack
+from continual_steg.tasks import TASKS, Task, apply_attack
 
 
 def set_seed(seed: int):
@@ -33,22 +33,22 @@ def parse_args():
     parser.add_argument("--checkpoint_dir", default="runs/continual")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--resume", default="")
-    parser.add_argument("--tasks", default="clean,jpeg,gaussian,resize,crop")
-    parser.add_argument(
-        "--strategy",
-        choices=["continual", "sequential_finetune"],
-        default="continual",
-        help="continual adapter isolation or naive sequential fine-tuning baseline",
-    )
+    parser.add_argument("--tasks", default="clean,jpeg,gaussian,resize")
+    parser.add_argument("--strategy", choices=["continual", "sequential_finetune"], default="continual")
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs_per_task", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--shared_lr_scale", type=float, default=0.1,
+                        help="learning-rate multiplier for shared UDH weights after task 0")
     parser.add_argument("--adapter_bottleneck", type=int, default=32)
     parser.add_argument("--prompt_dim", type=int, default=64)
     parser.add_argument("--replay_capacity", type=int, default=256)
-    parser.add_argument("--replay_per_batch", type=int, default=2)
+    parser.add_argument("--replay_per_batch", type=int, default=4)
+    parser.add_argument("--replay_weight", type=float, default=1.0)
     parser.add_argument("--lambda_distill", type=float, default=0.2)
+    parser.add_argument("--no_shared_training", action="store_true",
+                        help="freeze shared weights after clean stage for adapter-only ablation")
     parser.add_argument("--max_train_batches", type=int, default=0)
     parser.add_argument("--max_val_batches", type=int, default=0)
     parser.add_argument("--workers", type=int, default=2)
@@ -62,66 +62,81 @@ def get_tasks(text: str):
     unknown = [name for name in names if name not in TASKS]
     if unknown:
         raise ValueError(f"unknown task(s): {unknown}; available={sorted(TASKS)}")
+    if not names or names[0] != "clean":
+        raise ValueError("the first task must be clean to preserve the UDH reference stage")
     return [TASKS[name] for name in names]
 
 
 def make_loader(root, image_size, batch_size, workers, shuffle):
     dataset = PairedImageDataset(root, image_size)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, drop_last=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=workers, drop_last=shuffle, pin_memory=True)
+
+
+def _task_loss(model, cover, secret, task: Task):
+    container, _ = model.hide_reveal(cover, secret, task.task_id)
+    attacked = apply_attack(container, task)
+    recovered = model.reveal_container(attacked, task.task_id)
+    return (F.l1_loss(container, cover), F.l1_loss(recovered, secret), container, recovered)
+
+
+def _distill_loss(model, old_model, cover, secret, task_ids, device):
+    terms = []
+    for old_task_id in task_ids.unique().tolist():
+        mask = task_ids == old_task_id
+        task = next(item for item in TASKS.values() if item.task_id == int(old_task_id))
+        with torch.no_grad():
+            old_container, _ = old_model.hide_reveal(cover[mask], secret[mask], int(old_task_id))
+            old_recovered = old_model.reveal_container(apply_attack(old_container, task), int(old_task_id))
+        new_container, _ = model.hide_reveal(cover[mask], secret[mask], int(old_task_id))
+        new_recovered = model.reveal_container(apply_attack(new_container, task), int(old_task_id))
+        terms.extend([F.mse_loss(new_container, old_container), F.mse_loss(new_recovered, old_recovered)])
+    return torch.stack(terms).mean() if terms else torch.zeros((), device=device)
 
 
 def train_one_task(model, old_model, task, loader, replay, args, device, optimizer,
                    start_epoch=0, checkpoint_callback=None):
     model.train()
     for epoch in range(start_epoch, args.epochs_per_task):
-        cover_sum = secret_sum = distill_sum = 0.0
+        cover_sum = secret_sum = replay_sum = distill_sum = 0.0
         batches = 0
         for batch_index, (cover, secret) in enumerate(tqdm(loader, desc=f"task={task.name} epoch={epoch + 1}")):
             if args.max_train_batches and batch_index >= args.max_train_batches:
                 break
-            cover, secret = cover.to(device), secret.to(device)
-            container, _ = model.hide_reveal(cover, secret, task.task_id)
-            attacked = apply_attack(container, task)
-            recovered = model.reveal_container(attacked, task.task_id)
-
-            cover_loss = F.l1_loss(container, cover)
-            secret_loss = F.l1_loss(recovered, secret)
+            cover, secret = cover.to(device, non_blocking=True), secret.to(device, non_blocking=True)
+            cover_loss, secret_loss, _, _ = _task_loss(model, cover, secret, task)
+            replay_loss = torch.zeros((), device=device)
             distill_loss = torch.zeros((), device=device)
 
             memory = replay.sample(args.replay_per_batch)
-            if old_model is not None and memory is not None:
+            if memory is not None:
                 old_cover, old_secret, old_task = memory
                 old_cover, old_secret = old_cover.to(device), old_secret.to(device)
-                distill_terms = []
-                for old_task_id in old_task.unique().tolist():
-                    mask = old_task == old_task_id
-                    with torch.no_grad():
-                        old_container, old_recovered = old_model.hide_reveal(
-                            old_cover[mask], old_secret[mask], int(old_task_id)
-                        )
-                    new_container, new_recovered = model.hide_reveal(
-                        old_cover[mask], old_secret[mask], int(old_task_id)
-                    )
-                    distill_terms.append(
-                        F.mse_loss(new_container, old_container)
-                        + F.mse_loss(new_recovered, old_recovered)
-                    )
-                distill_loss = torch.stack(distill_terms).mean()
+                replay_terms = []
+                for replay_task_id in old_task.unique().tolist():
+                    mask = old_task == replay_task_id
+                    replay_task = next(item for item in TASKS.values() if item.task_id == int(replay_task_id))
+                    replay_cover_loss, replay_secret_loss, _, _ = _task_loss(
+                        model, old_cover[mask], old_secret[mask], replay_task)
+                    replay_terms.append(replay_cover_loss + replay_secret_loss)
+                replay_loss = torch.stack(replay_terms).mean()
+                if old_model is not None:
+                    distill_loss = _distill_loss(model, old_model, old_cover, old_secret, old_task, device)
 
-            loss = cover_loss + secret_loss + args.lambda_distill * distill_loss
+            loss = cover_loss + secret_loss + args.replay_weight * replay_loss + args.lambda_distill * distill_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
             cover_sum += cover_loss.item()
             secret_sum += secret_loss.item()
+            replay_sum += replay_loss.item()
             distill_sum += distill_loss.item()
             batches += 1
         divisor = max(1, batches)
         print(f"task={task.name} epoch={epoch + 1}/{args.epochs_per_task} "
               f"cover={cover_sum / divisor:.6f} secret={secret_sum / divisor:.6f} "
-              f"distill={distill_sum / divisor:.6f}")
+              f"replay={replay_sum / divisor:.6f} distill={distill_sum / divisor:.6f}")
         if checkpoint_callback is not None:
             checkpoint_callback(epoch + 1)
 
@@ -159,24 +174,17 @@ def main():
     model = ContinualHidingModel(max(task.task_id for task in tasks) + 1,
                                  args.adapter_bottleneck, args.prompt_dim).to(device)
     replay = ReplayBuffer(args.replay_capacity)
-    start_task = 0
-    start_epoch = 0
-    resume_state = None
+    start_task, start_epoch, resume_state = 0, 0, None
     checkpoint_path = args.checkpoint or args.resume
     if checkpoint_path:
         state = torch.load(checkpoint_path, map_location=device)
-        saved_strategy = state.get("strategy", "continual")
-        if saved_strategy != args.strategy:
-            raise ValueError(
-                f"checkpoint strategy={saved_strategy!r} does not match "
-                f"requested strategy={args.strategy!r}"
-            )
+        if state.get("strategy", "continual") != args.strategy:
+            raise ValueError("checkpoint strategy does not match requested strategy")
         resume_state = state
         model.load_state_dict(state["model"])
         replay.load_state_dict(state["replay"])
         if int(state.get("epoch", args.epochs_per_task)) < args.epochs_per_task:
-            start_task = int(state["task_id"])
-            start_epoch = int(state.get("epoch", 0))
+            start_task, start_epoch = int(state["task_id"]), int(state.get("epoch", 0))
         else:
             start_task = int(state["task_id"]) + 1
 
@@ -185,7 +193,6 @@ def main():
     train_loader = make_loader(train_root, args.image_size, args.batch_size, args.workers, True)
     val_loader = make_loader(val_root, args.image_size, args.batch_size, args.workers, False)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
     if args.mode == "eval":
         for task in tasks:
             print(task.name, evaluate(model, task, val_loader, device, args.max_val_batches))
@@ -194,44 +201,44 @@ def main():
     old_model = None
     for task in tasks[start_task:]:
         if args.strategy == "sequential_finetune":
-            # Naive baseline: update the full model for every task and do not
-            # keep a frozen teacher. Replay/distillation can be disabled from
-            # the command line for a pure sequential fine-tuning comparison.
             old_model = None
             for parameter in model.parameters():
                 parameter.requires_grad = True
         elif task.task_id == 0 and start_task == 0:
             for parameter in model.parameters():
                 parameter.requires_grad = True
-            for name, parameter in model.named_parameters():
-                if "adapters." in name or "prompt_bias." in name:
-                    parameter.requires_grad = ".0." in name
-                elif "prompt_bank.prompts" in name:
-                    parameter.requires_grad = name.endswith(".0")
         else:
             old_model = model.clone_frozen()
-            model.train_only_task(task.task_id)
+            model.train_only_task(task.task_id, train_shared=not args.no_shared_training)
 
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                      lr=args.learning_rate, weight_decay=1e-4)
+        active, shared = [], []
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts")):
+                active.append(parameter)
+            else:
+                shared.append(parameter)
+        groups = [{"params": active, "lr": args.learning_rate}]
+        if shared:
+            groups.append({"params": shared, "lr": args.learning_rate * args.shared_lr_scale})
+        optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
         if resume_state is not None and task.task_id == start_task and start_epoch > 0:
             optimizer.load_state_dict(resume_state["optimizer"])
         latest_path = os.path.join(args.checkpoint_dir, "latest.pt")
-        def checkpoint_callback(epoch):
-            save_stage(latest_path, model, optimizer, replay, task.task_id, epoch, args.strategy)
+        checkpoint_callback = lambda epoch: save_stage(
+            latest_path, model, optimizer, replay, task.task_id, epoch, args.strategy)
         train_one_task(model, old_model, task, train_loader, replay, args, device, optimizer,
                        start_epoch=start_epoch if task.task_id == start_task else 0,
                        checkpoint_callback=checkpoint_callback)
+
         replay_cover, replay_secret = next(iter(train_loader))
         with torch.no_grad():
-            prototype_cover = replay_cover.to(device)
-            prototype_secret = replay_secret.to(device)
-            prototype_container, _ = model.hide_reveal(prototype_cover, prototype_secret, task.task_id)
+            prototype_container, _ = model.hide_reveal(replay_cover.to(device), replay_secret.to(device), task.task_id)
             model.update_prototype(prototype_container, task.task_id)
         replay.add(replay_cover, replay_secret, task.task_id)
-
         rows = []
-        for seen_task in tasks[:task.task_id + 1]:
+        for seen_task in tasks[:tasks.index(task) + 1]:
             metrics = evaluate(model, seen_task, val_loader, device, args.max_val_batches)
             rows.append({"stage": task.task_id, "task": seen_task.name, **metrics})
             print(f"stage={task.name} eval={seen_task.name} {metrics}")
