@@ -71,12 +71,14 @@ class HidingNet(nn.Module):
         for layer in self.prompt_bias:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
+        self.adapters_enabled = True
 
     def forward(self, cover: Tensor, secret: Tensor, task_id: int, prompt: Tensor) -> Tensor:
         del cover
         residual = self.model(secret)
-        residual = self.adapters[int(task_id)](residual)
-        residual = residual + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
+        if self.adapters_enabled:
+            residual = self.adapters[int(task_id)](residual)
+            residual = residual + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
         return residual * (10.0 / 255.0)
 
 
@@ -97,14 +99,16 @@ class RevealNet(nn.Module):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
         self.relu = nn.ReLU(True)
+        self.adapters_enabled = True
 
     def extract_feature(self, container: Tensor) -> Tensor:
         return self.relu(self.conv3(self.relu(self.conv2(self.relu(self.conv1(container))))))
 
     def forward(self, container: Tensor, task_id: int, prompt: Tensor) -> Tensor:
         x = self.extract_feature(container)
-        x = self.adapters[int(task_id)](x)
-        x = x + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
+        if self.adapters_enabled:
+            x = self.adapters[int(task_id)](x)
+            x = x + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
         x = self.relu(self.conv4(x))
         x = self.relu(self.conv5(x))
         return torch.sigmoid(self.conv6(x))
@@ -119,6 +123,13 @@ class ContinualHidingModel(nn.Module):
         self.prompt_bank = PromptBank(num_tasks, prompt_dim)
         self.register_buffer("prototypes", torch.zeros(num_tasks, 256))
         self.register_buffer("prototype_valid", torch.zeros(num_tasks, dtype=torch.bool))
+
+    def disable_adapters(self):
+        self.hiding.adapters_enabled = False
+        self.reveal.adapters_enabled = False
+        for name, parameter in self.named_parameters():
+            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts")):
+                parameter.requires_grad = False
 
     def hide_reveal(self, cover: Tensor, secret: Tensor, task_id: int):
         prompt = self.prompt_bank(task_id, cover.shape[0], cover.device)

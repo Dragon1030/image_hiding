@@ -53,6 +53,10 @@ def parse_args():
     parser.add_argument("--lambda_distill", type=float, default=0.2)
     parser.add_argument("--no_shared_training", action="store_true",
                         help="freeze shared weights after clean stage for adapter-only ablation")
+    parser.add_argument("--disable_adapters", action="store_true",
+                        help="disable all task adapters and prompt biases")
+    parser.add_argument("--stop_after_task", type=int, default=-1,
+                        help="stop after this task id, useful for clean-only ablations")
     parser.add_argument("--max_train_batches", type=int, default=0)
     parser.add_argument("--max_val_batches", type=int, default=0)
     parser.add_argument("--workers", type=int, default=2)
@@ -184,6 +188,8 @@ def main():
     tasks = get_tasks(args.tasks)
     model = ContinualHidingModel(max(task.task_id for task in tasks) + 1,
                                  args.adapter_bottleneck, args.prompt_dim).to(device)
+    if args.disable_adapters:
+        model.disable_adapters()
     replay = ReplayBuffer(args.replay_capacity)
     start_task, start_epoch, resume_state = 0, 0, None
     checkpoint_path = args.checkpoint or args.resume
@@ -193,6 +199,8 @@ def main():
             raise ValueError("checkpoint strategy does not match requested strategy")
         resume_state = state
         model.load_state_dict(state["model"])
+        if args.disable_adapters:
+            model.disable_adapters()
         replay.load_state_dict(state["replay"])
         if int(state.get("epoch", args.epochs_per_task)) < args.epochs_per_task:
             start_task, start_epoch = int(state["task_id"]), int(state.get("epoch", 0))
@@ -210,7 +218,8 @@ def main():
         return
 
     old_model = None
-    for task in tasks[start_task:]:
+    run_tasks = tasks if args.stop_after_task < 0 else tasks[:args.stop_after_task + 1]
+    for task in run_tasks[start_task:]:
         if args.strategy == "sequential_finetune":
             old_model = None
             for parameter in model.parameters():
@@ -221,6 +230,9 @@ def main():
         else:
             old_model = model.clone_frozen()
             model.train_only_task(task.task_id, train_shared=not args.no_shared_training)
+
+        if args.disable_adapters:
+            model.disable_adapters()
 
         active, shared = [], []
         for name, parameter in model.named_parameters():
