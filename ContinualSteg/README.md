@@ -28,7 +28,9 @@ clean -> JPEG -> Gaussian noise -> resize -> blur
 
 The clean stage uses an unconditioned UDH forward path. Task adapters and prompts are
 bypassed and excluded from optimization at task 0, so the clean checkpoint is the
-UDH baseline. Later stages freeze the clean UDH path, train only the new task
+UDH baseline.
+
+For task_id > 0, the continual path uses a gated depthwise bottleneck Adapter and a task-conditioned Prompt Pool. These modules are bypassed entirely by task 0. Existing checkpoints created before the strict clean-path or adapter-shape changes must be retrained. Later stages freeze the clean UDH path, train only the new task
 adapter/prompt and optional shared continual parameters, and use replay plus output
 distillation to reduce forgetting. Checkpoints created before this clean-path
 change must be retrained before they are used as the strict UDH reference.
