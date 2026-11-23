@@ -46,7 +46,7 @@ def build_model(checkpoint_path, device, disable_adapters):
     weights = state["model"]
     task_count = sum(key.startswith("prompt_bank.prompts.") for key in weights)
     prompt_dim = weights["prompt_bank.prompts.0"].shape[0]
-    adapter_weight = weights["hiding.adapters.0.down.weight"]
+    adapter_weight = weights["reveal.adapters.0.down.weight"]
     bottleneck = adapter_weight.shape[0]
     model = ContinualHidingModel(task_count, bottleneck, prompt_dim).to(device)
     model.load_state_dict(weights)
@@ -144,12 +144,14 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     loader = DataLoader(PairedImageDataset(args.val_dir, args.image_size),
-                        batch_size=args.batch_size, shuffle=True,
+                        batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, pin_memory=True)
     attack_tasks = [TASKS[name] for name in ("clean", "jpeg", "gaussian", "resize", "blur")]
     with_adapter = build_model(args.with_adapter_checkpoint, device, False)
     without_adapter = build_model(args.without_adapter_checkpoint, device, True)
+    torch.manual_seed(args.seed)
     rows_with, samples_with = evaluate_model(with_adapter, loader, device, attack_tasks)
+    torch.manual_seed(args.seed)
     rows_without, samples_without = evaluate_model(without_adapter, loader, device, attack_tasks)
     summary = average_rows(rows_with, "with_adapter") + average_rows(rows_without, "without_adapter")
     with open(out_dir / "clean_ablation_metrics.csv", "w", newline="") as handle:
