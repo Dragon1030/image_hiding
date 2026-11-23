@@ -26,9 +26,12 @@ The default continual stream is:
 clean -> JPEG -> Gaussian noise -> resize -> blur
 ```
 
-The clean stage trains the base hiding/reveal network. Later stages freeze the
-base and old task paths, train a new task adapter and prompt, and use replay
-plus output distillation to reduce forgetting.
+The clean stage uses an unconditioned UDH forward path. Task adapters and prompts are
+bypassed and excluded from optimization at task 0, so the clean checkpoint is the
+UDH baseline. Later stages freeze the clean UDH path, train only the new task
+adapter/prompt and optional shared continual parameters, and use replay plus output
+distillation to reduce forgetting. Checkpoints created before this clean-path
+change must be retrained before they are used as the strict UDH reference.
 
 ## Where continual learning appears
 
@@ -57,8 +60,9 @@ The default stream is:
 0 clean -> 1 JPEG -> 2 Gaussian noise -> 3 resize -> 4 blur
 ```
 
-Stage 0 trains the base hiding network. From stage 1 onward the base and old
-adapters are frozen and only the current adapter/prompt is updated. A replay
+Stage 0 trains only the original UDH parameters. From stage 1 onward the UDH
+parameters and old task paths are protected while the current task path and
+continual-learning losses are enabled. A replay
 memory and output distillation loss preserve previous tasks.
 
 ## Dataset layout
