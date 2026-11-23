@@ -173,7 +173,7 @@ class ContinualHidingModel(nn.Module):
         self.hiding.adapters_enabled = False
         self.reveal.adapters_enabled = False
         for name, parameter in self.named_parameters():
-            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts")):
+            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.pool", "prompt_bank.task_logits")):
                 parameter.requires_grad = False
 
     def hide_reveal(self, cover: Tensor, secret: Tensor, task_id: int):
@@ -201,7 +201,7 @@ class ContinualHidingModel(nn.Module):
             is_active = (f"adapters.{int(task_id)}." in name or
                          f"prompt_bias.{int(task_id)}." in name or
                          f"prompt_bank.prompts.{int(task_id)}" in name)
-            is_shared = not any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts"))
+            is_shared = not any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.pool", "prompt_bank.task_logits"))
             parameter.requires_grad = is_active or (train_shared and is_shared)
 
     def clone_frozen(self):
