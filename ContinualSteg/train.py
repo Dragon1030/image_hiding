@@ -225,8 +225,7 @@ def main():
             for parameter in model.parameters():
                 parameter.requires_grad = True
         elif task.task_id == 0 and start_task == 0:
-            for parameter in model.parameters():
-                parameter.requires_grad = True
+            model.train_clean_baseline()
         else:
             old_model = model.clone_frozen()
             model.train_only_task(task.task_id, train_shared=not args.no_shared_training)
