@@ -73,13 +73,17 @@ class HidingNet(nn.Module):
             nn.init.zeros_(layer.bias)
         self.adapters_enabled = True
 
+    def forward_udh(self, secret: Tensor) -> Tensor:
+        """Exact UDH hiding path with no task conditioning."""
+        return self.model(secret) * (10.0 / 255.0)
+
     def forward(self, cover: Tensor, secret: Tensor, task_id: int, prompt: Tensor) -> Tensor:
         del cover
-        residual = self.model(secret)
-        if self.adapters_enabled:
+        residual = self.forward_udh(secret)
+        if self.adapters_enabled and int(task_id) != 0:
             residual = self.adapters[int(task_id)](residual)
             residual = residual + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
-        return residual * (10.0 / 255.0)
+        return residual
 
 
 class RevealNet(nn.Module):
@@ -104,9 +108,16 @@ class RevealNet(nn.Module):
     def extract_feature(self, container: Tensor) -> Tensor:
         return self.relu(self.conv3(self.relu(self.conv2(self.relu(self.conv1(container))))))
 
+    def forward_udh(self, container: Tensor) -> Tensor:
+        """Exact UDH reveal path with no task conditioning."""
+        x = self.extract_feature(container)
+        x = self.relu(self.conv4(x))
+        x = self.relu(self.conv5(x))
+        return torch.sigmoid(self.conv6(x))
+
     def forward(self, container: Tensor, task_id: int, prompt: Tensor) -> Tensor:
         x = self.extract_feature(container)
-        if self.adapters_enabled:
+        if self.adapters_enabled and int(task_id) != 0:
             x = self.adapters[int(task_id)](x)
             x = x + self.prompt_bias[int(task_id)](prompt).unsqueeze(-1).unsqueeze(-1)
         x = self.relu(self.conv4(x))
@@ -132,13 +143,24 @@ class ContinualHidingModel(nn.Module):
                 parameter.requires_grad = False
 
     def hide_reveal(self, cover: Tensor, secret: Tensor, task_id: int):
+        if int(task_id) == 0:
+            container = (cover + self.hiding.forward_udh(secret)).clamp(0, 1)
+            return container, self.reveal.forward_udh(container)
         prompt = self.prompt_bank(task_id, cover.shape[0], cover.device)
         container = (cover + self.hiding(cover, secret, task_id, prompt)).clamp(0, 1)
         return container, self.reveal(container, task_id, prompt)
 
     def reveal_container(self, container: Tensor, task_id: int):
+        if int(task_id) == 0:
+            return self.reveal.forward_udh(container)
         prompt = self.prompt_bank(task_id, container.shape[0], container.device)
         return self.reveal(container, task_id, prompt)
+
+    def train_clean_baseline(self):
+        """Train only the original UDH parameters for task 0."""
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = not any(token in name for token in (
+                "adapters.", "prompt_bias.", "prompt_bank.prompts"))
 
     def train_only_task(self, task_id: int, train_shared: bool = True):
         for name, parameter in self.named_parameters():
