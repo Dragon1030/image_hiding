@@ -8,26 +8,60 @@ import torch.nn.functional as F
 
 
 class SpatialAdapter(nn.Module):
+    """Gated depthwise bottleneck adapter for non-clean tasks.
+
+    The clean UDH path bypasses this module completely. The zero-initialized
+    output projection therefore only affects task_id > 0 after training.
+    """
+
     def __init__(self, channels: int, bottleneck: int):
         super().__init__()
         hidden = max(1, min(channels, bottleneck))
         self.norm = nn.GroupNorm(1, channels)
+        self.depthwise = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
         self.down = nn.Conv2d(channels, hidden, 1)
         self.up = nn.Conv2d(hidden, channels, 1)
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, max(1, channels // 4), 1),
+            nn.GELU(),
+            nn.Conv2d(max(1, channels // 4), channels, 1),
+            nn.Sigmoid(),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, 1, 3, padding=1),
+            nn.Sigmoid(),
+        )
+        self.scale = nn.Parameter(torch.tensor(0.0))
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        return x + self.up(F.gelu(self.down(self.norm(x))))
+        z = self.depthwise(self.norm(x))
+        z = self.up(F.gelu(self.down(z)))
+        gate = self.channel_gate(x) * self.spatial_gate(x)
+        return x + torch.tanh(self.scale) * gate * z
 
 
 class PromptBank(nn.Module):
-    def __init__(self, num_tasks: int, prompt_dim: int):
+    """Task-conditioned prompt pool used only by non-clean task paths."""
+
+    def __init__(self, num_tasks: int, prompt_dim: int, pool_size: int = 4):
         super().__init__()
-        self.prompts = nn.ParameterList([nn.Parameter(torch.zeros(prompt_dim)) for _ in range(num_tasks)])
+        # Keep one task seed per task for checkpoint introspection and routing.
+        self.prompts = nn.ParameterList(
+            [nn.Parameter(torch.zeros(prompt_dim)) for _ in range(num_tasks)]
+        )
+        self.pool = nn.Parameter(torch.zeros(pool_size, prompt_dim))
+        self.task_logits = nn.Parameter(torch.zeros(num_tasks, pool_size))
+        nn.init.normal_(self.pool, mean=0.0, std=0.02)
 
     def forward(self, task_id: int, batch_size: int, device: torch.device) -> Tensor:
-        return self.prompts[int(task_id)].view(1, -1).expand(batch_size, -1).to(device)
+        task_id = int(task_id)
+        weights = torch.softmax(self.task_logits[task_id], dim=-1)
+        pooled = weights @ self.pool
+        prompt = self.prompts[task_id] + pooled
+        return prompt.view(1, -1).expand(batch_size, -1).to(device)
 
 
 class _UnetBlock(nn.Module):
