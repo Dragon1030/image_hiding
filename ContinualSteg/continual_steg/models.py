@@ -195,7 +195,7 @@ class ContinualHidingModel(nn.Module):
         """Train only the original UDH parameters for task 0."""
         for name, parameter in self.named_parameters():
             parameter.requires_grad = not any(token in name for token in (
-                "adapters.", "prompt_bias.", "prompt_bank.prompts"))
+                "adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.pool", "prompt_bank.task_logits"))
 
     def train_only_task(self, task_id: int, train_shared: bool = True):
         task_id = int(task_id)
