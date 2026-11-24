@@ -44,16 +44,17 @@ class SpatialAdapter(nn.Module):
 
 
 class PromptBank(nn.Module):
-    """Task-conditioned prompt pool used only by non-clean task paths."""
+    """Task-conditioned prompt pool with per-task trainable coefficients."""
 
     def __init__(self, num_tasks: int, prompt_dim: int, pool_size: int = 4):
         super().__init__()
-        # Keep one task seed per task for checkpoint introspection and routing.
         self.prompts = nn.ParameterList(
             [nn.Parameter(torch.zeros(prompt_dim)) for _ in range(num_tasks)]
         )
         self.pool = nn.Parameter(torch.zeros(pool_size, prompt_dim))
-        self.task_logits = nn.Parameter(torch.zeros(num_tasks, pool_size))
+        self.task_logits = nn.ParameterList(
+            [nn.Parameter(torch.zeros(pool_size)) for _ in range(num_tasks)]
+        )
         nn.init.normal_(self.pool, mean=0.0, std=0.02)
 
     def forward(self, task_id: int, batch_size: int, device: torch.device) -> Tensor:
@@ -197,11 +198,18 @@ class ContinualHidingModel(nn.Module):
                 "adapters.", "prompt_bias.", "prompt_bank.prompts"))
 
     def train_only_task(self, task_id: int, train_shared: bool = True):
+        task_id = int(task_id)
         for name, parameter in self.named_parameters():
-            is_active = (f"adapters.{int(task_id)}." in name or
-                         f"prompt_bias.{int(task_id)}." in name or
-                         f"prompt_bank.prompts.{int(task_id)}" in name)
-            is_shared = not any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.pool", "prompt_bank.task_logits"))
+            is_active = (
+                f"adapters.{task_id}." in name
+                or f"prompt_bias.{task_id}." in name
+                or f"prompt_bank.prompts.{task_id}" in name
+                or f"prompt_bank.task_logits.{task_id}" in name
+            )
+            is_shared = not any(token in name for token in (
+                "adapters.", "prompt_bias.", "prompt_bank.prompts",
+                "prompt_bank.pool", "prompt_bank.task_logits"
+            ))
             parameter.requires_grad = is_active or (train_shared and is_shared)
 
     def clone_frozen(self):
