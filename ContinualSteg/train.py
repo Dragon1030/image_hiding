@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--prompt_dim", type=int, default=64)
     parser.add_argument("--replay_capacity", type=int, default=256)
     parser.add_argument("--replay_per_batch", type=int, default=4)
+    parser.add_argument("--replay_seed_per_task", type=int, default=64)
     parser.add_argument("--replay_weight", type=float, default=1.0)
     parser.add_argument("--lambda_distill", type=float, default=0.2)
     parser.add_argument("--no_shared_training", action="store_true",
@@ -79,6 +80,17 @@ def make_loader(root, image_size, batch_size, workers, shuffle):
     dataset = PairedImageDataset(root, image_size)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                       num_workers=workers, drop_last=shuffle, pin_memory=True)
+
+
+def seed_replay_from_loader(replay, loader, task_id, target_count):
+    if replay.capacity <= 0 or target_count <= 0:
+        return
+    collected = 0
+    for cover, secret in loader:
+        replay.add(cover, secret, task_id)
+        collected += int(cover.shape[0])
+        if collected >= target_count:
+            break
 
 
 def _task_loss(model, cover, secret, task: Task, loss_name="mse", secret_weight=0.75):
@@ -112,6 +124,7 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
     model.train()
     for epoch in range(start_epoch, args.epochs_per_task):
         cover_sum = secret_sum = replay_sum = distill_sum = 0.0
+        replay_count = distill_count = empty_replay_batches = 0
         batches = 0
         for batch_index, (cover, secret) in enumerate(tqdm(loader, desc=f"task={task.name} epoch={epoch + 1}")):
             if args.max_train_batches and batch_index >= args.max_train_batches:
@@ -126,6 +139,7 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
             if memory is not None:
                 old_cover, old_secret, old_task = memory
                 old_cover, old_secret = old_cover.to(device), old_secret.to(device)
+                replay_count += int(old_task.numel())
                 replay_terms = []
                 for replay_task_id in old_task.unique().tolist():
                     mask = old_task == replay_task_id
@@ -137,6 +151,9 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
                 replay_loss = torch.stack(replay_terms).mean()
                 if old_model is not None:
                     distill_loss = _distill_loss(model, old_model, old_cover, old_secret, old_task, device)
+                    distill_count += int(old_task.numel())
+            elif old_model is not None:
+                empty_replay_batches += 1
 
             loss = cover_loss + secret_loss + args.replay_weight * replay_loss + args.lambda_distill * distill_loss
             optimizer.zero_grad(set_to_none=True)
@@ -151,7 +168,9 @@ def train_one_task(model, old_model, task, loader, replay, args, device, optimiz
         divisor = max(1, batches)
         print(f"task={task.name} epoch={epoch + 1}/{args.epochs_per_task} "
               f"cover={cover_sum / divisor:.6f} secret={secret_sum / divisor:.6f} "
-              f"replay={replay_sum / divisor:.6f} distill={distill_sum / divisor:.6f}")
+              f"replay={replay_sum / divisor:.6f} distill={distill_sum / divisor:.6f} "
+              f"replay_n={replay_count} distill_n={distill_count} "
+              f"empty_replay_batches={empty_replay_batches}")
         if checkpoint_callback is not None:
             checkpoint_callback(epoch + 1)
 
@@ -201,7 +220,7 @@ def main():
         model.load_state_dict(state["model"])
         if args.disable_adapters:
             model.disable_adapters()
-        replay.load_state_dict(state["replay"])
+        replay.load_state_dict(state["replay"], capacity=args.replay_capacity)
         if int(state.get("epoch", args.epochs_per_task)) < args.epochs_per_task:
             start_task, start_epoch = int(state["task_id"]), int(state.get("epoch", 0))
         else:
@@ -212,6 +231,11 @@ def main():
     train_loader = make_loader(train_root, args.image_size, args.batch_size, args.workers, True)
     val_loader = make_loader(val_root, args.image_size, args.batch_size, args.workers, False)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    # A clean-only checkpoint intentionally contains no Replay items. Seed the
+    # first old task before starting task 1 so Replay and Distillation are real.
+    if start_task > 0 and replay.capacity > 0 and not replay.items:
+        seed_replay_from_loader(replay, train_loader, 0, args.replay_seed_per_task)
+        print(f"seeded replay task=0 items={len(replay.items)} capacity={replay.capacity}")
     if args.mode == "eval":
         for task in tasks:
             print(task.name, evaluate(model, task, val_loader, device, args.max_val_batches))
@@ -237,7 +261,7 @@ def main():
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
                 continue
-            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts")):
+            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.task_logits")):
                 active.append(parameter)
             else:
                 shared.append(parameter)
@@ -258,7 +282,7 @@ def main():
         with torch.no_grad():
             prototype_container, _ = model.hide_reveal(replay_cover.to(device), replay_secret.to(device), task.task_id)
             model.update_prototype(prototype_container, task.task_id)
-        replay.add(replay_cover, replay_secret, task.task_id)
+        seed_replay_from_loader(replay, train_loader, task.task_id, args.replay_seed_per_task)
         rows = []
         for seen_task in tasks[:tasks.index(task) + 1]:
             metrics = evaluate(model, seen_task, val_loader, device, args.max_val_batches)
