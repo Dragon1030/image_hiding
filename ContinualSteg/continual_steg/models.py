@@ -44,23 +44,28 @@ class SpatialAdapter(nn.Module):
 
 
 class PromptBank(nn.Module):
-    """Task-conditioned prompt pool with per-task trainable coefficients."""
+    """Per-task prompt pools with per-task trainable mixture coefficients."""
 
     def __init__(self, num_tasks: int, prompt_dim: int, pool_size: int = 4):
         super().__init__()
         self.prompts = nn.ParameterList(
             [nn.Parameter(torch.zeros(prompt_dim)) for _ in range(num_tasks)]
         )
-        self.pool = nn.Parameter(torch.zeros(pool_size, prompt_dim))
-        self.task_logits = nn.ParameterList(
-            [nn.Parameter(torch.zeros(pool_size)) for _ in range(num_tasks)]
-        )
-        nn.init.normal_(self.pool, mean=0.0, std=0.02)
+        self.pool = nn.ParameterList([
+            nn.Parameter(torch.empty(pool_size, prompt_dim))
+            for _ in range(num_tasks)
+        ])
+        self.task_logits = nn.ParameterList([
+            nn.Parameter(torch.zeros(pool_size))
+            for _ in range(num_tasks)
+        ])
+        for pool in self.pool:
+            nn.init.normal_(pool, mean=0.0, std=0.02)
 
     def forward(self, task_id: int, batch_size: int, device: torch.device) -> Tensor:
         task_id = int(task_id)
         weights = torch.softmax(self.task_logits[task_id], dim=-1)
-        pooled = weights @ self.pool
+        pooled = weights @ self.pool[task_id]
         prompt = self.prompts[task_id] + pooled
         return prompt.view(1, -1).expand(batch_size, -1).to(device)
 
