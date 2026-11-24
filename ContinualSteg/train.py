@@ -261,7 +261,7 @@ def main():
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
                 continue
-            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.task_logits")):
+            if any(token in name for token in ("adapters.", "prompt_bias.", "prompt_bank.prompts", "prompt_bank.task_logits", "prompt_bank.pool")):
                 active.append(parameter)
             else:
                 shared.append(parameter)
